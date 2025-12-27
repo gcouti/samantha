@@ -1,22 +1,28 @@
 """
 LLM Managers module
 """
-import os
-import json
 import logging
 import aiohttp
 import operator
+
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, TypedDict, Annotated
 
 from dotenv import load_dotenv
 from agents.general_agent import GeneralAgent
+from agents.orchestrator_agent import OrchestratorAgent
 
 # Imports do LangGraph geralmente vêm do sub módulo 'graph'
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage
+
 from llm_providers import LLMConfig, LLMProviderFactory, LLMProvider, BaseLLMProvider
+
+from langchain_google_community import GmailToolkit
+from langchain_google_community.gmail.utils import build_resource_service, get_gmail_credentials
+
 
 load_dotenv()
 
@@ -96,7 +102,9 @@ class LLMManager(BaseLLMManager):
 class LangFlowManager(BaseLLMManager):
     """Manages LangFlow integration for complex multi-agent workflows."""
     
-    def __init__(self, base_url: str = "http://localhost:7860"):
+    def __init__(self, preferred_provider: LLMProvider = LLMProvider.GEMINI, base_url: str = "http://localhost:7860"):
+        super().__init__(preferred_provider)
+
         self.base_url = base_url
         self.session = None
     
@@ -132,21 +140,7 @@ class LangFlowManager(BaseLLMManager):
         """Get list of available LangFlow workflows."""
         if not self.session:
             self.session = aiohttp.ClientSession()
-        
-        try:
-            url = f"{self.base_url}/api/v1/flows"
-            
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    flows = await response.json()
-                    return flows
-                else:
-                    logger.error(f"Error getting flows: {response.status}")
-                    return []
-                    
-        except Exception as e:
-            logger.error(f"Error getting flows: {str(e)}")
-            return []
+
 
     async def process_text(self, text: str, thread_id: str = "default") -> Dict[str, Any]:
         """Process text using LangFlow for complex multi-agent workflows."""
@@ -237,11 +231,14 @@ class AgentState(TypedDict):
 class LangGraphManager(BaseLLMManager):
     """Manages LangGraph workflows for multi-agent coordination."""
     
-    def __init__(self, llm_manager: LLMManager = None):
-        self.llm_manager = llm_manager or LLMManager()
+    def __init__(self, preferred_provider: LLMProvider = LLMProvider.GEMINI):
+        super().__init__(preferred_provider)
         
         # Initialize the workflow
+        self.orchestrator_agent = OrchestratorAgent(self.current_provider)
+        self.general_agent = GeneralAgent(self.current_provider)
         self.workflow = self._create_workflow()
+
         self.app = self.workflow.compile(checkpointer=MemorySaver())
     
     def _create_workflow(self) -> StateGraph:
@@ -249,125 +246,75 @@ class LangGraphManager(BaseLLMManager):
         
         # Define the workflow nodes
         workflow = StateGraph(AgentState)
-        
+     
+        tools = []
+        tools.append(GmailTool().search_gmail_dynamic)
+        tool_node = ToolNode(tools=tools)
+
         # Add nodes
-        workflow.add_node("classify_intent", self._classify_intent_node)
-        workflow.add_node("select_agent", self._select_agent_node)
-        workflow.add_node("process_with_agent", self._process_with_agent_node)
-        workflow.add_node("generate_response", self._generate_response_node)
+        workflow.add_node("orchestrator_agent", self._orchestrator_node)
+        workflow.add_node("general_agent", self._general_node)
+        workflow.add_node("tools", tool_node)
         
         # Add edges
-        workflow.set_entry_point("classify_intent")
-        workflow.add_edge("classify_intent", "select_agent")
-        workflow.add_edge("select_agent", "process_with_agent")
-        workflow.add_edge("process_with_agent", "generate_response")
-        workflow.add_edge("generate_response", END)
+        workflow.set_entry_point("orchestrator_agent")
+        workflow.add_edge("orchestrator_agent", "general_agent")
+        
+        # --- A MÁGICA ACONTECE AQUI (ARESTAS CONDICIONAIS) ---
+        # Se o chatbot retornou uma tool_call -> vá para "tools"
+        # Se o chatbot retornou texto normal -> vá para END
+        
+        workflow.add_conditional_edges(
+            "orchestrator_agent",
+            tools_condition, 
+        )
+
+        # Se a ferramenta rodou, volta para o orchestrator_agent para ele ler o resultado
+        workflow.add_edge("tools", "orchestrator_agent")
+        workflow.set_finish_point("general_agent")
         
         return workflow
     
-    async def _classify_intent_node(self, state: AgentState) -> AgentState:
+    async def _orchestrator_node(self, state: AgentState) -> AgentState:
         """Classify user intent using LLM."""
+
         try:
-            intent_result = await self.llm_manager.classify_intent(state['text'])
-            
-            state["intent"] = intent_result.get("intent", "unknown")
-            state["entities"] = intent_result.get("entities", {})
-            state["metadata"]["intent_classification"] = intent_result
-            
-            logger.info(f"Intent classified: {state['intent']}")
+            intent_result = await self.orchestrator_agent.handle(state['text'], {})
+            state["selected_agent"] = intent_result['agent']
+
+            logger.info(f"Selected agent: {intent_result['agent']}")
+
             return state
             
         except Exception as e:
             logger.error(f"Error classifying intent: {str(e)}")
-            state["intent"] = "unknown"
-            state["entities"] = {}
+            state["selected_agent"] = "unknown"
             return state
     
-    async def _select_agent_node(self, state: AgentState) -> AgentState:
-        """Select the appropriate agent using LLM."""
+    async def _general_node(self, state: AgentState) -> AgentState:
+        """Generate response using the general agent."""
         try:
-            agent_result = await self.llm_manager.select_agent(
+            agent_result = await self.general_agent.handle(
                 state['text'], 
                 state['intent'], 
                 state['entities']
             )
             
-            state["selected_agent"] = agent_result.get("agent", "general_agent")
+            state["response"] = agent_result.get("text", "Desculpe, não consegui processar sua solicitação.")
+            state["confidence"] = agent_result.get("confidence", 0.5)
+            state["selected_agent"] = "general_agent"
             state["metadata"]["agent_selection"] = agent_result
             
-            logger.info(f"Agent selected: {state['selected_agent']}")
+            logger.info(f"Response generated by general agent")
             return state
                         
         except Exception as e:
-            logger.error(f"Error selecting agent: {str(e)}")
-
-            return state
-    
-    async def _process_with_agent_node(self, state: AgentState) -> AgentState:
-        """Process the request with the selected agent."""
-        try:
-            from agents import GeneralAgent, LangFlowAgent, ToolAgent
-            
-            # Get the appropriate agent
-            agent_map = {
-                "tool_agent": ToolAgent(),
-                "general_agent": GeneralAgent(),
-                "langflow_agent": LangFlowAgent()
-            }
-            
-            agent = agent_map.get(state["selected_agent"], GeneralAgent())
-            
-            # Process with the agent
-            result = await agent.handle(
-                state["text"], 
-                state["intent"], 
-                state["entities"]
-            )
-            
-            state["response"] = result.get("response", "Processamento concluído.")
-            state["confidence"] = result.get("confidence", 0.5)
-            state["metadata"]["agent_result"] = result
-            
-            logger.info(f"Agent {state['selected_agent']} processed request")
-            return state
-            
-        except Exception as e:
-            logger.error(f"Error processing with agent: {str(e)}")
-            state["response"] = "Desculpe, ocorreu um erro durante o processamento."
+            logger.error(f"Error generating response: {str(e)}")
+            state["response"] = "Desculpe, ocorreu um erro ao processar sua solicitação."
             state["confidence"] = 0.0
+            state["selected_agent"] = "system"
             return state
     
-    async def _generate_response_node(self, state: AgentState) -> AgentState:
-        """Generate final response using LLM for enhancement."""
-        try:
-            if state["confidence"] < 0.7:
-                # Enhance response with LLM if confidence is low
-                enhancement_prompt = f"""
-                Melhore a seguinte resposta do assistente virtual Samantha:
-                
-                Resposta original: {state['response']}
-                Intenção: {state['intent']}
-                Agente usado: {state['selected_agent']}
-                
-                Torne a resposta mais natural, prestativa e em português.
-                Mantenha o significado original mas melhore a formulação.
-                """
-                
-                response = await self.llm_manager.generate_response([
-                    {"role": "system", "content": "Você é um assistente virtual chamado Samantha."},
-                    {"role": "user", "content": enhancement_prompt}
-                ])
-                
-                state["response"] = response
-                state["confidence"] = min(state["confidence"] + 0.2, 1.0)
-                state["metadata"]["llm_enhanced"] = True
-            
-            state["metadata"]["final_response"] = True
-            return state
-            
-        except Exception as e:
-            logger.error(f"Error generating final response: {str(e)}")
-            return state
     
     async def process_text(self, text: str, thread_id: str = "default") -> Dict[str, Any]:
         """Process text using the LangGraph workflow."""
@@ -387,18 +334,18 @@ class LangGraphManager(BaseLLMManager):
             result = await self.app.ainvoke(initial_state, config)
 
             return {
-                "response": result["response"],
-                "agent": result["selected_agent"],
-                "confidence": result["confidence"],
+                "response": result.get("response", "Desculpe, não consegui processar sua solicitação."),
+                "agent": result.get("selected_agent", "system"),
+                "confidence": result.get("confidence", 0.0),
                 "processing_method": "langgraph",
                 "llm_enhanced": True,
                 "thread_id": thread_id,
                 "metadata": {
-                    "intent": result["intent"],
-                    "entities": result["entities"],
+                    "intent": result.get("intent"),
+                    "entities": result.get("entities", {}),
                     "langgraph_workflow": True,
                     "thread_id": thread_id,
-                    **result["metadata"],
+                    **result.get("metadata", {}),
                 },
             }
 

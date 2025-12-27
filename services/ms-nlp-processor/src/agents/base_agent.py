@@ -1,5 +1,9 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
+import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 class BaseAgent(ABC):
     """Base class for all agents in the multi-agent system."""
@@ -24,6 +28,22 @@ class BaseAgent(ABC):
         """Process the input and return a response."""
         pass
     
+    def _parse_json_response(self, content: str) -> Dict[str, Any]:
+        """Parse JSON content from LLM response, handling markdown code blocks."""
+        if content.startswith("```json"):
+            content = content.replace("```json", "").replace("```", "").strip()
+        
+        try:                                
+            return json.loads(content)
+
+        except json.JSONDecodeError as json_error:
+            logger.error(f"JSON decode error: {str(json_error)}")
+            logger.error(f"Content that failed to parse: {content}")
+            return {
+                "success": False,
+                "error": f"Resposta inválida do modelo: {str(json_error)}"
+            }
+
     async def process(self, text: str, intent: str, entities: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Process the input or pass it to the next agent in the chain."""
         if self.can_handle(intent, entities):

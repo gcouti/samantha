@@ -5,10 +5,9 @@ This module implements the main NLP processing logic and coordinates the agents
 using LLM, LangFlow, and LangGraph for intelligent multi-agent decision making.
 """
 
-import os
 import logging
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 from llm_managers import LLMManager, LangFlowManager, LangGraphManager
 
 logger = logging.getLogger(__name__)
@@ -38,7 +37,7 @@ class NLPProcessor:
             # processing_method = await self._select_processing_method(text, thread_id)
             
             # TODO: Force to be simplier first, and then we will introduce more complex code here
-            processing_method = "llm_agents"
+            processing_method = "langgraph"
 
             # Execute using the selected method
             if processing_method == "langgraph":

@@ -1,14 +1,33 @@
 """
 FastAPI application for the NLP Processor service with LLM and LangFlow integration.
 """
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from dotenv import load_dotenv
+
+load_dotenv()
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default-secret-key")
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 import uvicorn
 import logging
+import json
+import os
+
+import glob
 
 from processor import NLPProcessor
+from src.tools.gmail_tool import iniciar_login, receber_callback
+from starlette.requests import Request
+from starlette.responses import RedirectResponse
+from .auth import oauth
+from .database.database import get_db
+from .database.models import User
+from sqlalchemy.orm import Session
+import jwt
+import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +62,16 @@ class ProcessResponse(BaseModel):
     agent: str
     confidence: float
     metadata: Dict[str, Any] = {}
+
+class GmailLoginResponse(BaseModel):
+    authorization_url: str
+    state: str
+    message: str
+
+class GmailCallbackResponse(BaseModel):
+    success: bool
+    message: strimport os
+    credentials_stored: bool = False
 
 class HealthResponse(BaseModel):
     status: str
@@ -133,10 +162,7 @@ async def health_check():
 
 @app.get("/agents")
 async def list_agents():
-    """List available agents in the system by scanning the agents directory."""
-    import os
-    import glob
-    
+    """List available agents in the system by scanning the agents directory."""    
     agents_dir = os.path.join(os.path.dirname(__file__), "agents")
     agent_files = glob.glob(os.path.join(agents_dir, "*_agent.py"))
     
@@ -194,6 +220,121 @@ async def list_agents():
         "scanned_from": agents_dir
     }
 
+
+@app.get("/integrations/gmail", response_model=GmailLoginResponse)
+async def gmail_login():
+    """
+    Inicia o processo de login com Gmail.
+    Retorna a URL de autorização para o usuário acessar.
+    """
+    try:
+        # Verifica se o arquivo client_secrets.json existe
+        if not os.path.exists('client_secrets.json'):
+            return GmailLoginResponse(
+                authorization_url="",
+                state="",
+                message="Arquivo client_secrets.json não encontrado. Configure as credenciais do Gmail."
+            )
+        
+        # Inicia o processo de login
+        auth_url, state = iniciar_login()
+        
+        return GmailLoginResponse(
+            authorization_url=auth_url,
+            state=state,
+            message="URL de autorização gerada com sucesso. Acesse a URL para autorizar o acesso ao Gmail."
+        )
+    
+    except Exception as e:
+        logger.error(f"Erro ao iniciar login Gmail: {str(e)}")
+        return GmailLoginResponse(
+            authorization_url="",
+            state="",
+            message=f"Erro ao iniciar login: {str(e)}"
+        )
+
+
+@app.get("/integrations/gmail/callback", response_model=GmailCallbackResponse)
+async def gmail_callback(code: str = Query(...), state: str = Query(...)):
+    """
+    Endpoint de callback para o OAuth2 do Gmail.
+    O Google redireciona o usuário para esta URL após a autorização.
+    """
+    try:
+        # Constrói a URL completa recebida
+        callback_url = f"http://localhost:8000/gmail/callback?code={code}&state={state}"
+        
+        # Processa o callback e obtém as credenciais
+        credentials = receber_callback(callback_url)
+        
+        if credentials:
+            # Armazena as credenciais em um arquivo para uso posterior
+            credentials_json = {
+                'token': credentials.token,
+                'refresh_token': credentials.refresh_token,
+                'token_uri': credentials.token_uri,
+                'client_id': credentials.client_id,
+                'client_secret': credentials.client_secret,
+                'scopes': credentials.scopes,
+                'expiry': credentials.expiry.isoformat() if credentials.expiry else None
+            }
+            
+            with open('gmail_credentials.json', 'w') as f:
+                json.dump(credentials_json, f, indent=2)
+            
+            return GmailCallbackResponse(
+                success=True,
+                message="Login com Gmail realizado com sucesso! Credenciais armazenadas.",
+                credentials_stored=True
+            )
+        else:
+            return GmailCallbackResponse(
+                success=False,
+                message="Falha ao obter credenciais do Gmail.",
+                credentials_stored=False
+            )
+    
+    except Exception as e:
+        logger.error(f"Erro no callback Gmail: {str(e)}")
+        return GmailCallbackResponse(
+            success=False,
+            message=f"Erro no processamento do callback: {str(e)}",
+            credentials_stored=False
+        )
+
+@app.get("/integrations/gmail/status")
+async def gmail_status():
+    """
+    Verifica o sta", retus da conexão com Gmail.
+    """
+    try:
+        if os.path.exists('gmail_credentials.json'):
+            with open('gmail_credentials.json', 'r') as f:
+                credentials = json.load(f)
+            
+            return {
+                "connected": True,
+                "message": "Conectado ao Gmail",
+                "scopes": credentials.get('scopes', []),
+                "has_refresh_token": bool(credentials.get('refresh_token'))
+            }
+        else:
+            return {
+                "connected": False,
+                "message": "Não conectado ao Gmail. Use /gmail/login para autenticar.",
+                "scopes": [],
+                "has_refresh_token": False
+            }
+    
+    except Exception as e:
+        logger.error(f"Erro ao verificar status Gmail: {str(e)}")
+        return {
+            "connected": False,
+            "message": f"Erro ao verificar status: {str(e)}",
+            "scopes": [],
+            "has_refresh_token": False
+        }
+
 @app.get("/flows")
 async def list_langflow_flows():
     """List available LangFlow workflows."""
@@ -214,6 +355,125 @@ async def list_langflow_flows():
             "langflow_available": False,
             "error": str(e)
         }
+
+# --- Auth Routes ---
+
+@app.get('/auth/login/google', tags=["Auth"])
+async def login_google(request: Request):
+    redirect_uri = request.url_for('auth_google')
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get('/auth/callback/google', name='auth_google', tags=["Auth"])
+async def auth_google(request: Request, db: Session = Depends(get_db)):
+    try:
+        token = await oauth.google.authorize_access_token(request)
+    except Exception as e:
+        logger.error(f"Error during Google OAuth callback: {e}")
+        raise HTTPException(status_code=400, detail="Could not authorize Google access token")
+
+    user_info = token.get('userinfo')
+
+    if user_info:
+        oauth_provider = 'google'
+        oauth_id = user_info['sub']
+        email = user_info.get('email')
+
+        # Find user by provider and oauth_id
+        db_user = db.query(User).filter(User.oauth_provider == oauth_provider, User.oauth_id == oauth_id).first()
+
+        if not db_user:
+            # If not found, check if an account with that email already exists
+            if email:
+                db_user = db.query(User).filter(User.email == email).first()
+                if db_user:
+                    # Link account
+                    db_user.oauth_provider = oauth_provider
+                    db_user.oauth_id = oauth_id
+                else:
+                    # Create new user
+                    db_user = User(
+                        email=email,
+                        oauth_provider=oauth_provider,
+                        oauth_id=oauth_id
+                    )
+                    db.add(db_user)
+            else:
+                # Create new user without email
+                db_user = User(
+                    oauth_provider=oauth_provider,
+                    oauth_id=oauth_id
+                )
+                db.add(db_user)
+            
+            db.commit()
+            db.refresh(db_user)
+
+        # Generate JWT
+        jwt_payload = {
+            "sub": db_user.id,
+            "email": db_user.email,
+            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        }
+        jwt_token = jwt.encode(jwt_payload, JWT_SECRET_KEY, algorithm="HS256")
+
+        return {"access_token": jwt_token, "token_type": "bearer"}
+
+    raise HTTPException(status_code=400, detail="Could not fetch user info from Google")
+
+
+@app.get('/auth/login/apple', tags=["Auth"])
+async def login_apple(request: Request):
+    redirect_uri = request.url_for('auth_apple')
+    return await oauth.apple.authorize_redirect(request, redirect_uri)
+
+
+@app.post('/auth/callback/apple', name='auth_apple', tags=["Auth"])
+async def auth_apple(request: Request, db: Session = Depends(get_db)):
+    try:
+        token = await oauth.apple.authorize_access_token(request)
+    except Exception as e:
+        logger.error(f"Error during Apple OAuth callback: {e}")
+        raise HTTPException(status_code=400, detail="Could not authorize Apple access token")
+
+    # O userinfo da Apple está dentro do id_token, que precisa ser decodificado
+    user_info = await oauth.apple.parse_id_token(request, token)
+
+    if user_info:
+        oauth_provider = 'apple'
+        oauth_id = user_info['sub']
+        email = user_info.get('email')
+
+        db_user = db.query(User).filter(User.oauth_provider == oauth_provider, User.oauth_id == oauth_id).first()
+
+        if not db_user:
+            if email:
+                db_user = db.query(User).filter(User.email == email).first()
+                if db_user:
+                    db_user.oauth_provider = oauth_provider
+                    db_user.oauth_id = oauth_id
+                else:
+                    db_user = User(email=email, oauth_provider=oauth_provider, oauth_id=oauth_id)
+                    db.add(db_user)
+            else:
+                # A Apple só envia o email na primeira vez. Se não veio, o usuário já deve existir.
+                # Se não existir, não podemos criar uma conta sem email.
+                raise HTTPException(status_code=400, detail="Email not provided by Apple. Please try logging in with another method first.")
+            
+            db.commit()
+            db.refresh(db_user)
+
+        jwt_payload = {
+            "sub": db_user.id,
+            "email": db_user.email,
+            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        }
+        jwt_token = jwt.encode(jwt_payload, JWT_SECRET_KEY, algorithm="HS256")
+
+        return {"access_token": jwt_token, "token_type": "bearer"}
+
+    raise HTTPException(status_code=400, detail="Could not fetch user info from Apple")
+
 
 if __name__ == "__main__":
     uvicorn.run(
