@@ -64,3 +64,13 @@ Organizar reuniões:
         # agente para verificar se a resposta final é correta
         # agente para verificar se a resposta precisa ser atualziada, se é uma pergunta que leva em consideração o tempo e a informação perece: Exemplo qual foi o resultado do jogo do galo
         # agente para verificar se precisa de mais informações para completar a resposta
+
+### Web Search
+
+To perform a web search, simply ask a question that requires information from the internet. The agent will automatically use the `WebSearchTool` to find the answer.
+
+**Example:**
+
+```
+python -m services.ms-cli-interface --email your_email@example.com "Qual a capital da Australia?"
+```

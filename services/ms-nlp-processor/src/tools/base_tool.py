@@ -15,7 +15,7 @@ class BaseTool(ABC):
         self.description = description
         self.safe_commands = []
         
-    @abstractmethod
+    # @abstractmethod
     async def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute the tool with given parameters.
@@ -28,7 +28,7 @@ class BaseTool(ABC):
         """
         pass
     
-    @abstractmethod
+    # @abstractmethod
     def get_schema(self) -> Dict[str, Any]:
         """
         Get the tool schema for parameter validation and documentation.

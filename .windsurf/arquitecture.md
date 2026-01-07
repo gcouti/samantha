@@ -1,263 +1,171 @@
 # 🏗️ Arquitetura do Sistema Samantha
 
-Samantha é uma assistente virtual inteligente, multicanal e extensível, construída sobre uma **arquitetura de microsserviços** e um **núcleo NLP multi‑agente**.  
-A arquitetura atual foi simplificada e atualizada para refletir:
+Samantha é uma assistente virtual inteligente, multicanal e extensível, construída sobre uma **arquitetura de microsserviços** e um **núcleo NLP multiagente**.  
+A arquitetura atual reflete:
 
-- Uso de **LLMs multi‑provider** (OpenAI, Gemini, Claude) via Strategy Pattern  
-- Núcleo NLP em `ms-nlp-processor` com **agentes especializados + ferramentas**  
-- Orquestração opcional via **LangFlow** e **LangGraph**  
-- Remoção de módulos/agents antigos (ex: `greeting_agent`, `task_agent`, `weather_agent`, `llm_integration.py`, `langgraph_integration.py`)
+- Uso de **LLMs multi‑provider** (OpenAI, Gemini, Claude) via Strategy Pattern.  
+- Núcleo NLP em `ms-nlp-processor` operando com **LangGraph** e integração opcional com **LangFlow**.  
+- Clientes e conectores independentes, como a CLI interativa (`ms-cli-interface`).  
+- Scripts de infraestrutura para provisionamento rápido (ex.: criação de usuários).  
+
+> Sempre que o ambiente Python precisar ser usado manualmente, ative o virtualenv: `source .venv/bin/activate`.
 
 ---
 
-## 1. 📂 Visão Geral de Pastas (Relevante)
+## 1. 📂 Visão Geral de Pastas
 
 ```text
 /data/dev/samantha
-├─ main.py
+├─ main.py                      # Script raiz que delega para a CLI
 ├─ README.md
-├─ .windsurf/
-│  ├─ samantha.md
-│  └─ arquitecture.md   ← ESTE DOCUMENTO
-└─ services/
-   ├─ ms-nlp-processor/
-   │  ├─ app.py
-   │  ├─ requirements.txt
-   │  ├─ .env.example
-   │  └─ src/
-   │     ├─ api.py
-   │     ├─ processor.py
-   │     ├─ llm_providers.py
-   │     ├─ llm_managers.py
-   │     ├─ agents/
-   │     │  ├─ __init__.py
-   │     │  ├─ base_agent.py
-   │     │  ├─ general_agent.py
-   │     │  ├─ langflow_agent.py
-   │     │  └─ tool_agent.py
-   │     └─ tools/
-   │        ├─ __init__.py
-   │        ├─ base_tool.py
-   │        ├─ shell_tool.py
-   │        └─ weather_tool.py
-   ├─ ms-cli-interface/           (não detalhado aqui)
-   ├─ ms-external-data/           (não detalhado aqui)
-   ├─ ms-nlp-processor/           ← FOCO ATUAL
-   └─ ms-task-scheduler/          (não detalhado aqui)
+├─ docs/                        # Reservado para documentação complementar
+├─ infrastructure/
+│  └─ create_user.py            # Script para provisionar contas no banco local
+├─ services/
+│  ├─ ms-cli-interface/
+│  │  ├─ app.py                 # Entrada assíncrona da CLI
+│  │  ├─ README.md
+│  │  └─ src/
+│  │     ├─ config.py           # Configurações e .env da CLI
+│  │     └─ nlp_client.py       # Cliente HTTPX para o ms-nlp-processor
+│  └─ ms-nlp-processor/         # Serviço FastAPI + LangGraph (FOCO)
+│     ├─ .env / .env.example
+│     ├─ requirements.txt
+│     ├─ Dockerfile / fly.toml / start.sh
+│     └─ src/
+│        ├─ api.py              # FastAPI endpoints
+│        ├─ processor.py        # `NLPProcessor`
+│        ├─ main.py             # Entrypoint Uvicorn
+│        ├─ auth.py / security.py
+│        ├─ llm_providers.py
+│        ├─ llm_managers.py
+│        ├─ agents/
+│        ├─ tools/
+│        └─ database/
+└─ .windsurf/                   # Documentação viva (este arquivo + samantha.md)
 ```
 
-
-## 2. 🌐 Camada de Interfaces (Canais / Front‑ends)
-
-Esta camada continua sendo composta por adaptadores/microsserviços específicos (WhatsApp, Slack, e‑mail, etc.), que **não são detalhados neste documento**, mas possuem um papel claro:
-
-- Recebem mensagens dos usuários
-- Normalizam em um payload de texto + metadados
-- Chamam o serviço `ms-nlp-processor` via HTTP (FastAPI) no endpoint `/process`
+**Pastas não utilizadas** (`docs/`, futuros microsserviços) permanecem reservadas para expansão.
 
 ---
 
-## 3. 🧠 Núcleo NLP: `ms-nlp-processor`
+## 2. 🧩 Tipos de Sistemas e Canais
 
-O serviço **ms-nlp-processor** é o cérebro conversacional da Samantha:
-
-- Expõe uma API HTTP (FastAPI) em `src/api.py`
-- Orquestra agentes e ferramentas em `src/processor.py`
-- Usa múltiplos provedores LLM através de Strategy Pattern:
-  - OpenAI, Gemini, Claude (e extensível para outros)
-
-### 3.1 API (`src/api.py`)
-
-Principais endpoints:
-
-- `POST /process`
-  - Request:  
-    - `text`: texto do usuário  
-    - `context`: dicionário opcional de contexto  
-    - `thread_id`: ID de conversa (para workflows com estado, ex: LangGraph)
-  - A API **não decide mais qual engine usar**.  
-    Ela delega tudo para `NLPProcessor.process_text`, que decide internamente.
-- `GET /agents`
-  - Lista dinamicamente os agentes presentes em `src/agents/`  
-  - Ignora `__init__.py` e `base_agent.py`  
-  - Faz import dinâmico para extrair `description` de cada agente.
-- `GET /flows`
-  - Lista fluxos disponíveis do LangFlow (quando configurado).
-- `GET /health`
-  - Indica se LLM, LangFlow e LangGraph estão disponíveis.
-- `GET /conversation/{thread_id}`
-  - Retorna histórico de conversas quando LangGraph está em uso.
-
-### 3.2 Processor (`src/processor.py`)
-
-`NLPProcessor` é o orquestrador central.  
-Responsabilidades:
-
-- Inicializar **LLMManager**, **LangFlowManager** e **LangGraphManager**
-- Montar a cadeia de agentes:
-
-  ```text
-  ToolAgent → GeneralAgent → LangFlowAgent → UnknownAgent
-  ```
-
-- Método principal:
-
-  ```python
-  async def process_text(self, text: str, thread_id: str = "default") -> Dict[str, Any]
-  ```
-
-  - (Neste momento) está **forçado** a usar `"llm_agents"` como método principal  
-    (há um TODO para reativar seleção inteligente de `llm_agents` / `langflow` / `langgraph`)
-  - Processa:
-    1. Classificação de intenção + entidades (via LLMManager)
-    2. Passagem pela cadeia de agents
-    3. Retorno de resposta + metadados (intent, agent, confidence, etc.)
+1. **Interfaces de usuário (front-ends / canais):** bots de WhatsApp, Slack, e-mail ou webhooks externos. Cada canal converte mensagens para um payload HTTP e chama `ms-nlp-processor`.  
+2. **Cliente oficial (ms-cli-interface):** terminal interativo com feedback colorido, autenticação simplificada e histórico local.  
+3. **Núcleo cognitivo (ms-nlp-processor):** FastAPI + LangGraph. É onde vivem agentes, ferramentas, gerenciadores LLM e bancos.  
+4. **Scripts de infraestrutura:** utilitários Python (ex.: `infrastructure/create_user.py`) para preparar dados locais.
 
 ---
 
-## 4. 🤖 Agentes (`src/agents/`)
+## 3. 💬 Cliente CLI (`services/ms-cli-interface`)
 
-Agentes seguem o padrão **Chain of Responsibility** (classe base `BaseAgent`).
-
-Agentes atuais:
-
-- `GeneralAgent`
-  - Agente genérico, LLM‑powered.
-  - Responde perguntas gerais, “small talk”, etc.
-- `ToolAgent`
-  - Agente responsável por invocar **ferramentas** (`tools/`).
-  - Ex.: executar comandos de sistema seguros, buscar clima real, etc.
-- `LangFlowAgent`
-  - Encaminha requisições para workflows definidos no **LangFlow**.
-- `UnknownAgent`
-  - Fallback final quando nenhum outro agente assume.
-
-> **Agents removidos**  
-> - `GreetingAgent`, `TaskAgent`, `WeatherAgent` foram removidos.  
->   - Suas capacidades foram substituídas por LLM + `GeneralAgent` e `ToolAgent` + `WeatherTool`.
+- `app.py`: inicializa `SamanthaCLI`, controla sinais, imprime painéis Rich e coleta entradas com `prompt_toolkit`.  
+- `src/nlp_client.py`: cliente `httpx.AsyncClient` que chama `POST /process`, injeta cabeçalhos `Authorization` + `X-User-Email` quando necessário.  
+- `src/config.py`: centraliza variáveis (`NLP_SERVICE_URL`, `CLI_TIMEOUT`, etc.) lidas do `.env`.  
+- Execução via `python -m services.ms-cli-interface --email ...` ou `python main.py` (delegando para `app.main()`).
 
 ---
 
-## 5. 🛠️ Ferramentas (`src/tools/`)
+## 4. 🧠 Núcleo NLP (`services/ms-nlp-processor`)
 
-As ferramentas materializam capacidades que podem ser executadas pelos agentes (principalmente `ToolAgent`).
+### 4.1 Estrutura principal
 
-- `BaseTool`
-  - Interface base para todas as tools.
-  - Implementa:
-    - Validação de parâmetros (`get_schema` + `validate_parameters`)
-    - Checagem de comandos perigosos.
-- `ShellTool`
-  - Executa comandos de **shell seguros** (via `asyncio.subprocess`).
-  - Possui whitelist de comandos permitidos e blacklist de comandos perigosos.
-  - Exemplos:
-    - `ls`, `pwd`, `whoami`, `df`, `free`, `grep`, etc.
-- `WeatherTool`
-  - Busca informações de **clima real** usando APIs externas:
-    - OpenWeatherMap
-    - WeatherAPI.com
-    - weather.gov (fallback para EUA)
-  - Substitui completamente o antigo `WeatherAgent`.
-- `ToolManager`
-  - Registra ferramentas (`ShellTool`, `WeatherTool`, etc.)
-  - Fornece:
-    - `execute_tool(name, params)`
-    - `list_tools()`
-    - `get_tool_schemas()`
+- `src/api.py`: FastAPI com middlewares (CORS + sessões) e endpoints `/process`, `/agents`, `/flows`, `/health`, `/conversation/{thread_id}`, além dos fluxos de autenticação Google/Gmail.  
+- `src/processor.py`: instancia `LLMManager`, `LangFlowManager` e `LangGraphManager`. Atualmente força o método `"langgraph"` até que a seleção automática seja reativada.  
+- `src/llm_providers.py`: Strategy + Factory para conectar OpenAI, Gemini e Claude (cada provider declara `generate_response`, `is_available`, etc.).  
+- `src/llm_managers.py`: ponto mais rico; define `LLMManager`, `LangFlowManager` e `LangGraphManager` (com o grafo de estados, agentes e integração com ferramentas).  
+- `src/database/`: SQLAlchemy (`database.py`, `models.py`, `crud.py`) e SQLite embutido (`samantha_users.db`) para armazenar contas e `notes_path`.  
+- `auth.py` + `security.py`: geração/validação de JWTs, configuração OAuth (Google/Apple) e helpers para extrair o e-mail autenticado.
 
-`ToolAgent` usa `ToolManager` + LLM (`LLMManager`) para:
+### 4.2 API (`src/api.py`)
 
-1. Entender a intenção do usuário
-2. Escolher a tool apropriada
-3. Definir parâmetros
-4. Executar a tool
-5. Traduzir o resultado em resposta natural em português
+- `POST /process`: recebe `text`, `context`, `thread_id` e `email` opcional.  
+  - Valida JWT via `get_current_user_email` e compara com o corpo.  
+  - Chama `await nlp_processor.process_text(...)` e devolve `ProcessResponse` com `metadata` detalhado (intent, entities, método, etc.).  
+- `GET /agents`: usa `agents.utils.collect_agent_descriptions` para inspecionar dinamicamente os arquivos em `src/agents/`.  
+- `GET /flows`: lista fluxos disponíveis no LangFlow (quando `LANGFLOW_URL` está configurado).  
+- `GET /health`: status geral (LLM, LangFlow, LangGraph).  
+- `GET /conversation/{thread_id}`: histórico baseado na memória do LangGraph (`MemorySaver`).  
+- Endpoints auxiliares: `/gmail/login`, `/gmail/callback`, `/test-token/{email}`, etc., que dependem de `tools.gmail_tool`.
 
----
+### 4.3 Processor & Managers
 
-## 6. 🧬 LLM Multi‑Provider (`src/llm_providers.py` + `src/llm_managers.py`)
+- `NLPProcessor.process_text(text, thread_id, email)`  
+  - (temporário) `processing_method = "langgraph"`.  
+  - Redireciona para `LangGraphManager.process_text`, que constrói o estado inicial (`AgentState`) com mensagens, email e metadados.  
+- `LangGraphManager`  
+  - Monta um `StateGraph` com nós: `check_user`, `orchestrator_agent`, `general_agent`, `tools`, `configuration_node`, `handle_notes_path_update_node`, `authentication_required_node`, `wait_for_input_node`.  
+  - Usa `MemorySaver` para checkpoints e permite `get_conversation_history`.  
+  - Faz binding de ferramentas ao provider atual (`llm_with_tools = provider.client.bind_tools(...)`).  
+- `LLMManager`  
+  - Responsável por invocar diretamente o provider preferido (fallback automático) quando o fluxo dispensa LangGraph.  
+- `LangFlowManager`  
+  - Cliente `aiohttp` para executar flows em servidores LangFlow externos (`/api/v1/run/{flow_id}`), retornando metadados quando flows estão disponíveis.
 
-### 6.1 Strategy Pattern de Provedores (`llm_providers.py`)
+### 4.4 Agentes (`src/agents/`)
 
-- `LLMProvider` (Enum):
-  - `OPENAI`, `GEMINI`, `CLAUDE`
-- `LLMConfig`:
-  - Modelo, temperatura, max_tokens, api_key (carregada de env)
-- `BaseLLMProvider`:
-  - Interface abstrata (`generate_response`, `is_available`)
-- Implementações:
-  - `OpenAIProvider`
-  - `GeminiProvider`
-  - `ClaudeProvider`
-- `LLMProviderFactory`:
-  - Cria instâncias de providers
-  - Descobre quais provedores estão disponíveis com base em:
-    - libs instaladas
-    - variáveis de ambiente (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `CLAUDE_API_KEY`)
+| Arquivo | Papel |
+| --- | --- |
+| `base_agent.py` | Classe abstrata com `can_handle`, `handle`, encadeamento e sanitização de JSON. |
+| `general_agent.py` | Agente default; usa o provider atual (com ferramentas bindadas) para responder mensagens e decidir tool calls. |
+| `orchestrator_agent.py` | Descreve os agentes disponíveis e decide qual caminho seguir (general, calendar, websearch, email, etc.). Ele prepara prompts ricos para o LangGraph. |
+| `configuration_agent.py` | Pergunta ou confirma configurações essenciais (ex.: `notes_path`). |
+| `utils.py` | Descobre agentes e ferramentas dinamicamente para exposição via API. |
 
-### 6.2 LLMManager + LangGraphManager (`llm_managers.py`)
+> Agentes antigos (`ToolAgent`, `LangFlowAgent`, etc.) foram removidos. Hoje a orquestração acontece no LangGraph usando `GeneralAgent` + ferramentas bindadas.
 
-- `LLMManager`
-  - Usa providers do `LLMProviderFactory` com **fallback automático**.
-  - Exposto para:
-    - Classificar intenção (`classify_intent`)
-    - Selecionar agente (`select_agent`)
-    - Gerar respostas (`generate_response`)
-- `LangFlowManager`
-  - Cliente para chamar APIs do LangFlow (`/api/v1/run/{flow_id}`, `/api/v1/flows`).
-- `LangGraphManager`
-  - Implementa workflows com **LangGraph**:
-    - Nodes:
-      - `classify_intent`
-      - `select_agent`
-      - `process_with_agent`
-      - `generate_response`
-    - Usa `LLMManager` internamente (não depende mais de `langgraph_integration.py` antigo).
-  - Fornece:
-    - `process_text(text, thread_id)`
-    - `get_conversation_history(thread_id)`
+### 4.5 Ferramentas (`src/tools/`)
+
+- `base_tool.py`: helpers de validação e saneamento.  
+- `shell_tool.py`: execução controlada de comandos whitelisted (`ls`, `pwd`, `df`, etc.).  
+- `weather_tool.py`: integra OpenWeatherMap, WeatherAPI e weather.gov como fallback.  
+- `gmail_tool.py`: fluxo OAuth, listagem e busca de e-mails via Gmail API (usado pela API e pelo LangGraph).  
+- `web_search_tool.py`: busca web (LangChain integração).  
+- `note_tool.py`: `ObsidianGitHubTool` para ler/anotar notas num repositório GitHub; requer que o usuário informe `notes_path`.  
+- `tool_manager.py`: registro/execução das ferramentas (mantido para usos diretos); o LangGraph utiliza `ToolNode` com as mesmas funções.
+
+### 4.6 Banco e Autenticação
+
+- `database/models.py`: modelo `Account` (id, email, notes_path).  
+- `database/crud.py`: helpers `get_user_by_email`, `update_user_notes_path`.  
+- `infrastructure/create_user.py`: script CLI que chama `init_db()` e insere contas (útil para testes locais).  
+- `auth.py` / `security.py`:  
+  - `create_access_token`, `verify_jwt_token`, integrações OAuth (Google/Apple).  
+  - `get_current_user_email` garante o e-mail extraído do token.  
+  - Em ambiente *dev*, tokens `email@example.com:any` são aceitos para facilitar a CLI.
 
 ---
 
-## 7. 🔐 Configuração & Dependências
+## 5. 🛠️ Scripts e Documentação de Suporte
 
-### 7.1 `.env.example` (ms-nlp-processor)
-
-- Provedores LLM:
-  - `OPENAI_API_KEY`
-  - `GEMINI_API_KEY`
-  - `CLAUDE_API_KEY`
-- Clima:
-  - `OPENWEATHER_API_KEY`
-  - `WEATHERAPI_KEY`
-- LangFlow:
-  - `LANGFLOW_URL`
-- Serviço:
-  - `SERVICE_HOST`, `SERVICE_PORT`
-- Preferência de LLM:
-  - `PREFERRED_LLM_PROVIDER = openai | gemini | claude`
-
-### 7.2 `requirements.txt` (ms-nlp-processor)
-
-Inclui, entre outros:
-
-- `fastapi`, `uvicorn`, `pydantic`, `python-dotenv`, `aiohttp`
-- `langchain`, `langchain-openai`, `langchain-google-genai`, `langchain-anthropic`
-- `langgraph`, `openai`, `google-generativeai`, `anthropic`
+- `infrastructure/create_user.py`: provisiona usuários e já configura `notes_path`.  
+- `.windsurf/samantha.md`: guia operacional (roadmap, ideação).  
+- `docs/`: reservado para guias futuros (atualmente vazio).  
+- `README.md` (raiz): visão geral do produto e roadmap de features (integrável com calendar, web search, notas, etc.).
 
 ---
 
-## 8. 🧩 Resumo da Arquitetura Atual
+## 6. 🔗 Funções e Componentes Importantes
 
-- Arquitetura **multi‑agente + multi‑LLM** com microsserviços.
-- `ms-nlp-processor` centraliza:
-  - LLM multi‑provider (OpenAI/Gemini/Claude) com Strategy + Factory
-  - Agentes (General, Tool, LangFlow, Unknown)
-  - Tools (Shell, Weather, etc.)
-  - Orquestração opcional com LangFlow e LangGraph.
-- Agentes antigos baseados em regras (saudação, tarefa, clima) foram **removidos** em favor de:
-  - LLM + GeneralAgent
-  - Tools (WeatherTool) + ToolAgent
+| Área | Função / Método | Descrição rápida |
+| --- | --- | --- |
+| API | `process_text` (`src/api.py`) | Endpoint principal, valida headers, chama `NLPProcessor`, retorna `ProcessResponse`. |
+| Processamento | `NLPProcessor.process_text` (`src/processor.py`) | Seleciona o método (`langgraph`, `langflow`, `llm`) e delega execução. |
+| LangGraph | `LangGraphManager.process_text` (`src/llm_managers.py`) | Constroi `AgentState`, executa `StateGraph`, agrega mensagens/ferramentas e devolve resposta final. |
+| LangGraph Nodes | `_check_user_node`, `_configuration_router`, `_handle_notes_path_update_node` | Garantem autenticação, coleta de configuração (ex.: GitHub notes) e atualizam o banco. |
+| Agentes | `GeneralAgent.handle`, `OrchestratorAgent.handle` | O primeiro conversa diretamente com o usuário/LLM; o segundo decide qual capacidade melhor responde. |
+| Ferramentas | `ShellTool.execute`, `WeatherTool.get_weather`, `GmailTool.search_gmail_dynamic`, `ObsidianGitHubTool.read_note` | Capacidades externas invocadas via LangGraph/LLM. |
+| Segurança | `create_access_token` (`auth.py`), `verify_jwt_token` (`security.py`) | Geração e verificação de JWTs usados pela CLI e pelo serviço HTTP. |
+| Banco | `get_user_by_email`, `update_user_notes_path` (`database/crud.py`) | Persistem preferências como repositório de notas. |
 
-Esta é a **foto atual** da arquitetura da Samantha, refletindo apenas o que existe hoje no código, sem referências a pastas/módulos apagados.
+---
+
+## 7. 🧩 Resumo
+
+- Arquitetura **multiagente + multi‑LLM**, com LangGraph como orquestrador padrão.  
+- `ms-nlp-processor` concentra endpoints HTTP, agentes, ferramentas e integrações externas (Gmail, WebSearch, GitHub/Obsidian, clima, shell).  
+- `ms-cli-interface` fornece um cliente oficial simples e autenticado para testes locais ou demonstrações.  
+- Scripts de infraestrutura garantem bootstrap rápido (criação de usuários, configuração de notas).  
+- Documentação viva mantém o inventário de pastas, tipos de sistemas e funções críticas atualizados, servindo como referência central para evolução da Samantha.
 

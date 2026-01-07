@@ -13,6 +13,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from .base_tool import BaseTool
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class GmailTool(BaseTool):
         self.service = None
         
     @tool
-    def search_gmail_dynamic(query: str, config: RunnableConfig) -> str:
+    async def search_gmail_dynamic(query: str, config: RunnableConfig) -> str:
         """
         Busca emails no Gmail do usuário atual.
         Use esta ferramenta para encontrar informações em emails.

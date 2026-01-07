@@ -15,7 +15,7 @@ class Config:
     # NLP Service Configuration
     NLP_SERVICE_URL: str = os.getenv(
         "NLP_SERVICE_URL", 
-        "http://localhost:8000"
+        "http://localhost:8080"
     )
     
     # CLI Configuration

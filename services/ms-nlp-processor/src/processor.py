@@ -8,7 +8,7 @@ using LLM, LangFlow, and LangGraph for intelligent multi-agent decision making.
 import logging
 
 from typing import Dict, Any, List
-from llm_managers import LLMManager, LangFlowManager, LangGraphManager
+from llm_managers import LLMManager, LangGraphManager
 
 logger = logging.getLogger(__name__)
 
@@ -17,18 +17,18 @@ class NLPProcessor:
     
     def __init__(self):
         self.llm_manager = LLMManager()
-        self.langflow_manager = LangFlowManager()
         self.langgraph_manager = LangGraphManager()
         
     
-    async def process_text(self, text: str, thread_id: str = "default") -> Dict[str, Any]:
+    async def process_text(self, text: str, thread_id: str = "default", email: str = None) -> Dict[str, Any]:
         """
         Process the input text through intelligent engine selection.
         
         Args:
             text: The input text to process
             thread_id: Thread ID for conversation continuity
-            
+            email: The user's email for authentication
+
         Returns:
             Dict containing the response and metadata
         """
@@ -41,9 +41,7 @@ class NLPProcessor:
 
             # Execute using the selected method
             if processing_method == "langgraph":
-                return await self.langgraph_manager.process_text(text, thread_id)
-            elif processing_method == "langflow":
-                return await self.langflow_manager.process_text(text, thread_id)
+                return await self.langgraph_manager.process_text(text, thread_id, email)
             else:
                 return await self.llm_manager.process_text(text, thread_id)
                 
@@ -70,7 +68,6 @@ class NLPProcessor:
             
             Métodos disponíveis:
             - llm_agents: Para solicitações gerais usando cadeia de agentes com LLM
-            - langflow: Para workflows complexos e multi-agentes visuais
             - langgraph: Para conversas com estado e workflows baseados em estado
             
             Considere:
@@ -79,7 +76,7 @@ class NLPProcessor:
             3. Requisitos de workflow complexo
             4. Interações conversacionais
             
-            Responda apenas com o nome do método: llm_agents, langflow, ou langgraph
+            Responda apenas com o nome do método: llm_agents ou langgraph
             """
             
             messages = [
@@ -91,7 +88,7 @@ class NLPProcessor:
             selected_method = response.content.strip().lower()
             
             # Validate selected method
-            valid_methods = ["llm_agents", "langflow", "langgraph"]
+            valid_methods = ["llm_agents", "langgraph"]
             if selected_method in valid_methods:
                 logger.info(f"Selected processing method: {selected_method}")
                 return selected_method

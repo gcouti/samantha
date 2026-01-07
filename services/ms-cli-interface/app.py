@@ -5,11 +5,13 @@ CLI Interface for Samantha - Your Personal Assistant
 import asyncio
 import random
 import signal
+import argparse
 from typing import Dict, Any, Optional
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
 from rich import print
 from rich.status import Status
 
@@ -23,9 +25,15 @@ console = Console()
 class SamanthaCLI:
     """Main CLI application for Samantha."""
     
-    def __init__(self):
-        self.nlp_client = NLPClient(config.get_nlp_service_url())
+    def __init__(self, email: Optional[str] = None, access_token: Optional[str] = None):
+        self.nlp_client = NLPClient(
+            base_url=config.get_nlp_service_url(),
+            access_token=access_token
+        )
         self.running = True
+        self.email = email
+        self.history = InMemoryHistory()
+        self.session = PromptSession(history=self.history)
         
         # Register signal handler for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_interrupt)
@@ -53,8 +61,21 @@ class SamanthaCLI:
         """Process user input using the NLP service."""
         try:
             with Status("Pensando...", spinner="dots"):
-                response = await self.nlp_client.process_text(user_input)
+                response = await self.nlp_client.process_text(user_input, self.email)
+                
+                # Check if authentication is required
+                if response.get("requires_auth", False):
+                    console.print(f"\n[red]⚠️ {response.get('response', 'Erro de autenticação')}[/]")
+                    console.print("\nPor favor, faça login novamente para continuar.")
+                    console.print("Execute o comando a seguir para obter um novo token:")
+                    console.print("  [bold]curl http://localhost:8080/test-token/seu-email@exemplo.com[/]")
+                    console.print("E depois execute o cliente com o novo token:")
+                    console.print(f"  [bold]python -m app --email seu-email@exemplo.com --token SEU_TOKEN_AQUI[/]\n")
+                    self.running = False
+                    return ""
+                    
                 return response.get("response", "Desculpe, não consegui processar sua mensagem.")
+                
         except Exception as e:
             console.print(f"\n[red]Erro ao processar mensagem: {e}[/]")
             return "Ocorreu um erro ao processar sua mensagem. Por favor, tente novamente."
@@ -65,8 +86,8 @@ class SamanthaCLI:
         
         while self.running:
             try:
-                # Get user input with rich prompt
-                user_input = Prompt.ask("\n[bold]Você[/]")
+                # Get user input with prompt_toolkit session
+                user_input = await self.session.prompt_async("\nVocê: ")
                 
                 # Check for exit command
                 if user_input.lower() in ('sair', 'exit', 'quit'):
@@ -94,11 +115,19 @@ class SamanthaCLI:
 
 async def main():
     """Main entry point for the application."""
-    app = SamanthaCLI()
+    parser = argparse.ArgumentParser(description="Samantha - Your Personal Assistant")
+    parser.add_argument("--email", type=str, help="Email for authentication")
+    parser.add_argument("--token", type=str, help="Access token for authentication")
+    args = parser.parse_args()
+
+    cli = SamanthaCLI(
+        email=args.email,
+        access_token=args.token
+    )
     try:
-        await app.run()
+        await cli.run()
     finally:
-        await app.close()
+        await cli.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,3 +1,4 @@
 colorama==0.4.6
-rich==13.6.0
+rich==13.7.1
+prompt_toolkit==3.0.52
 python-dotenv==1.0.0

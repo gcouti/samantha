@@ -1,36 +1,39 @@
 """
 FastAPI application for the NLP Processor service with LLM and LangFlow integration.
 """
-from fastapi import FastAPI, HTTPException, Request, Query, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from dotenv import load_dotenv
-
-load_dotenv()
-
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default-secret-key")
-from pydantic import BaseModel
-from typing import Dict, Any, Optional
+import os
+import jwt
+import json
+import glob
 import uvicorn
 import logging
-import json
-import os
+from datetime import datetime, timedelta
 
-import glob
+from auth import oauth
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional
+from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header, status, Response
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from security import get_current_user_email, verify_email_in_request
+from auth import oauth, create_access_token, JWT_SECRET, JWT_ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
 
 from processor import NLPProcessor
-from src.tools.gmail_tool import iniciar_login, receber_callback
+from tools.gmail_tool import iniciar_login, receber_callback
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
-from .auth import oauth
-from .database.database import get_db
-from .database.models import User
+
 from sqlalchemy.orm import Session
-import jwt
-import datetime
+from database.models import Account
+from database.database import get_db
+
+load_dotenv()
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default-secret-key")
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Initialize the FastAPI app
@@ -40,10 +43,17 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# Add Session Middleware
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET_KEY", "your-secret-key-change-in-production"),
+    session_cookie="session"
+)
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # In production, replace with specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,6 +66,7 @@ class ProcessRequest(BaseModel):
     text: str
     context: Dict[str, Any] = {}
     thread_id: str = "default"
+    email: Optional[str] = None
 
 class ProcessResponse(BaseModel):
     response: str
@@ -70,7 +81,7 @@ class GmailLoginResponse(BaseModel):
 
 class GmailCallbackResponse(BaseModel):
     success: bool
-    message: strimport os
+    message: str
     credentials_stored: bool = False
 
 class HealthResponse(BaseModel):
@@ -81,19 +92,51 @@ class HealthResponse(BaseModel):
     langgraph_available: bool = False
 
 @app.post("/process", response_model=ProcessResponse)
-async def process_text(request: ProcessRequest):
+async def process_text(
+    request: Request,
+    request_data: ProcessRequest,
+    authorization: str = Header(..., description="JWT token"),
+    x_user_email: str = Header(..., description="User's email address")
+):
     """
     Process natural language text and return a response.
     
     Args:
-        request: The request containing the text to process and optional context
+        request: The request object
+        request_data: The request containing the text to process and optional context
+        authorization: JWT token in the format 'Bearer <token>'
+        x_user_email: User's email address
         
     Returns:
         The processed response with metadata
+        
+    Raises:
+        HTTPException: If authentication fails or email doesn't match
     """
+    # Verify JWT token and get the email from it
+    token_email = get_current_user_email(request)
+    
+    # Verify if the email in the token matches the email in the header
+    # if not verify_email_in_request(token_email, request):
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         detail="Email in token doesn't match the provided email"
+    #     )
+    
+    # Verify if the email in the request body matches the token email
+    if request_data.email and request_data.email.lower() != token_email.lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email in request body doesn't match the authenticated email"
+        )
+    
     try:
         # Delegate processing method selection to the processor
-        result = await nlp_processor.process_text(request.text, thread_id=request.thread_id)
+        result = await nlp_processor.process_text(
+            request_data.text, 
+            thread_id=request_data.thread_id,
+            email=token_email
+        )
         
         return ProcessResponse(
             response=result.get("response", "Desculpe, não consegui processar sua solicitação."),
@@ -108,7 +151,7 @@ async def process_text(request: ProcessRequest):
                 "llm_enhanced": result.get("llm_enhanced", False),
                 "processing_method": result.get("processing_method", "standard"),
                 "thread_id": result.get("thread_id"),
-                "context": request.context
+                "context": request_data.context
             }
         )
     except Exception as e:
@@ -116,10 +159,40 @@ async def process_text(request: ProcessRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/conversation/{thread_id}")
-async def get_conversation_history(thread_id: str):
-    """Get conversation history for a specific thread."""
+async def get_conversation_history(
+    thread_id: str,
+    request: Request,
+    authorization: str = Header(..., description="JWT token"),
+    x_user_email: str = Header(..., description="User's email address")
+):
+    """
+    Get conversation history for a specific thread.
+    
+    Args:
+        thread_id: The ID of the conversation thread
+        request: The request object
+        authorization: JWT token in the format 'Bearer <token>'
+        x_user_email: User's email address
+        
+    Returns:
+        The conversation history for the specified thread
+        
+    Raises:
+        HTTPException: If authentication fails or email doesn't match
+    """
+    # Verify JWT token and get the email from it
+    token_email = get_current_user_email(request)
+    
+    # Verify if the email in the token matches the email in the header
+    if not verify_email_in_request(token_email, request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email in token doesn't match the provided email"
+        )
+    
     try:
-        history = await nlp_processor.get_conversation_history(thread_id)
+        # Pass the email to ensure the user can only access their own conversations
+        history = await nlp_processor.get_conversation_history(thread_id, email=token_email)
         return {
             "thread_id": thread_id,
             "history": history,
@@ -132,7 +205,10 @@ async def get_conversation_history(thread_id: str):
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint with LLM, LangFlow, and LangGraph status."""
+    """
+    Health check endpoint with LLM, LangFlow, and LangGraph status.
+    This endpoint does not require authentication.
+    """
     try:
         # Check if LangFlow is available
         from llm_integration import LangFlowManager
@@ -161,8 +237,35 @@ async def health_check():
     )
 
 @app.get("/agents")
-async def list_agents():
-    """List available agents in the system by scanning the agents directory."""    
+async def list_agents(
+    request: Request,
+    authorization: str = Header(..., description="JWT token"),
+    x_user_email: str = Header(..., description="User's email address")
+):
+    """
+    List available agents in the system by scanning the agents directory.
+    
+    Args:
+        request: The request object
+        authorization: JWT token in the format 'Bearer <token>'
+        x_user_email: User's email address
+        
+    Returns:
+        List of available agents with their descriptions
+        
+    Raises:
+        HTTPException: If authentication fails or email doesn't match
+    """
+    # Verify JWT token and get the email from it
+    token_email = get_current_user_email(request)
+    
+    # Verify if the email in the token matches the email in the header
+    if not verify_email_in_request(token_email, request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email in token doesn't match the provided email"
+        )
+    
     agents_dir = os.path.join(os.path.dirname(__file__), "agents")
     agent_files = glob.glob(os.path.join(agents_dir, "*_agent.py"))
     
@@ -358,128 +461,313 @@ async def list_langflow_flows():
 
 # --- Auth Routes ---
 
-@app.get('/auth/login/google', tags=["Auth"])
+class Token(BaseModel):
+    """Token response model for authentication endpoints."""
+    access_token: str
+    token_type: str
+    expires_in: int = Field(..., description="Token expiration time in seconds")
+    user: dict = Field(..., description="User information")
+
+class UserResponse(BaseModel):
+    """User information response model."""
+    email: str
+    name: Optional[str] = None
+    picture: Optional[str] = None
+    is_active: bool = True
+
+@app.get("/auth/google/login", tags=["Authentication"])
 async def login_google(request: Request):
-    redirect_uri = request.url_for('auth_google')
-    return await oauth.google.authorize_redirect(request, redirect_uri)
-
-
-@app.get('/auth/callback/google', name='auth_google', tags=["Auth"])
-async def auth_google(request: Request, db: Session = Depends(get_db)):
+    """
+    Iniciar autenticação com Google.
+    
+    Redireciona para a página de login do Google e depois para o callback.
+    """
     try:
+        # Get the base URL from the request
+        base_url = str(request.base_url).rstrip('/')
+        redirect_uri = f"{base_url}/auth/google/callback"
+        
+        # Configure the OAuth client with the dynamic redirect_uri
+        oauth.google.client_kwargs['redirect_uri'] = redirect_uri
+        
+        # Generate the authorization URL and redirect
+        return await oauth.google.authorize_redirect(request, redirect_uri)
+    except Exception as e:
+        logger.error(f"Error in Google login: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to initiate Google login"
+        )
+
+@app.get("/auth/google/callback", response_model=Token, tags=["Authentication"])
+async def auth_google_callback(
+    request: Request, 
+    db: Session = Depends(get_db)
+):
+    """
+    Callback para autenticação com Google.
+    
+    Processa a resposta do Google após o login e retorna um JWT token.
+    """
+    try:
+        # Get the token from Google
         token = await oauth.google.authorize_access_token(request)
-    except Exception as e:
-        logger.error(f"Error during Google OAuth callback: {e}")
-        raise HTTPException(status_code=400, detail="Could not authorize Google access token")
-
-    user_info = token.get('userinfo')
-
-    if user_info:
-        oauth_provider = 'google'
-        oauth_id = user_info['sub']
-        email = user_info.get('email')
-
-        # Find user by provider and oauth_id
-        db_user = db.query(User).filter(User.oauth_provider == oauth_provider, User.oauth_id == oauth_id).first()
-
-        if not db_user:
-            # If not found, check if an account with that email already exists
-            if email:
-                db_user = db.query(User).filter(User.email == email).first()
-                if db_user:
-                    # Link account
-                    db_user.oauth_provider = oauth_provider
-                    db_user.oauth_id = oauth_id
-                else:
-                    # Create new user
-                    db_user = User(
-                        email=email,
-                        oauth_provider=oauth_provider,
-                        oauth_id=oauth_id
-                    )
-                    db.add(db_user)
-            else:
-                # Create new user without email
-                db_user = User(
-                    oauth_provider=oauth_provider,
-                    oauth_id=oauth_id
-                )
-                db.add(db_user)
-            
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not get token from Google"
+            )
+        
+        # Get user info from Google
+        user_info = token.get('userinfo')
+        if not user_info or 'email' not in user_info:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not get user email from Google"
+            )
+        
+        # Get or create user in database
+        user = db.query(Account).filter(Account.email == user_info['email']).first()
+        if not user:
+            # Create new user if not exists
+            user = Account(
+                email=user_info['email'],
+                name=user_info.get('name', user_info['email'].split('@')[0]),
+                picture=user_info.get('picture'),
+                is_active=True,
+                oauth_provider='google',
+                oauth_id=user_info.get('sub')
+            )
+            db.add(user)
             db.commit()
-            db.refresh(db_user)
-
-        # Generate JWT
-        jwt_payload = {
-            "sub": db_user.id,
-            "email": db_user.email,
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            db.refresh(user)
+        
+        # Create JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.email, "email": user.email},
+            expires_delta=access_token_expires
+        )
+        
+        # Prepare user data for response
+        user_data = {
+            "email": user.email,
+            "name": user.name,
+            "is_active": user.is_active
         }
-        jwt_token = jwt.encode(jwt_payload, JWT_SECRET_KEY, algorithm="HS256")
+        if user.picture:
+            user_data["picture"] = user.picture
+        
+        # Return the token and user info
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": int(access_token_expires.total_seconds()),
+            "user": user_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in Google auth callback: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred during authentication"
+        )
 
-        return {"access_token": jwt_token, "token_type": "bearer"}
-
-    raise HTTPException(status_code=400, detail="Could not fetch user info from Google")
-
-
-@app.get('/auth/login/apple', tags=["Auth"])
-async def login_apple(request: Request):
-    redirect_uri = request.url_for('auth_apple')
-    return await oauth.apple.authorize_redirect(request, redirect_uri)
-
-
-@app.post('/auth/callback/apple', name='auth_apple', tags=["Auth"])
-async def auth_apple(request: Request, db: Session = Depends(get_db)):
+@app.get("/auth/me", response_model=UserResponse, tags=["Authentication"])
+async def get_current_user(
+    request: Request,
+    authorization: str = Header(..., description="JWT token in format 'Bearer <token>'"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get current authenticated user information.
+    
+    Returns the user information for the authenticated user based on the JWT token.
+    """
     try:
-        token = await oauth.apple.authorize_access_token(request)
-    except Exception as e:
-        logger.error(f"Error during Apple OAuth callback: {e}")
-        raise HTTPException(status_code=400, detail="Could not authorize Apple access token")
-
-    # O userinfo da Apple está dentro do id_token, que precisa ser decodificado
-    user_info = await oauth.apple.parse_id_token(request, token)
-
-    if user_info:
-        oauth_provider = 'apple'
-        oauth_id = user_info['sub']
-        email = user_info.get('email')
-
-        db_user = db.query(User).filter(User.oauth_provider == oauth_provider, User.oauth_id == oauth_id).first()
-
-        if not db_user:
-            if email:
-                db_user = db.query(User).filter(User.email == email).first()
-                if db_user:
-                    db_user.oauth_provider = oauth_provider
-                    db_user.oauth_id = oauth_id
-                else:
-                    db_user = User(email=email, oauth_provider=oauth_provider, oauth_id=oauth_id)
-                    db.add(db_user)
-            else:
-                # A Apple só envia o email na primeira vez. Se não veio, o usuário já deve existir.
-                # Se não existir, não podemos criar uma conta sem email.
-                raise HTTPException(status_code=400, detail="Email not provided by Apple. Please try logging in with another method first.")
-            
-            db.commit()
-            db.refresh(db_user)
-
-        jwt_payload = {
-            "sub": db_user.id,
-            "email": db_user.email,
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        # Get token from Authorization header
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token = authorization.split(" ")[1]
+        
+        # Verify token and get user email
+        payload = verify_jwt_token(token)
+        if not payload or "email" not in payload:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Get user from database
+        user = db.query(Account).filter(Account.email == payload["email"]).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Return user data
+        user_data = {
+            "email": user.email,
+            "name": user.name,
+            "is_active": user.is_active
         }
-        jwt_token = jwt.encode(jwt_payload, JWT_SECRET_KEY, algorithm="HS256")
+        if user.picture:
+            user_data["picture"] = user.picture
+            
+        return user_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting current user: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while fetching user information"
+        )
 
-        return {"access_token": jwt_token, "token_type": "bearer"}
+# Apple OAuth Routes
 
-    raise HTTPException(status_code=400, detail="Could not fetch user info from Apple")
+@app.get('/auth/apple/login', tags=["Authentication"])
+async def login_apple(request: Request):
+    """
+    Iniciar autenticação com Apple.
+    
+    Redireciona para a página de login da Apple e depois para o callback.
+    """
+    try:
+        # Get the base URL from the request
+        base_url = str(request.base_url).rstrip('/')
+        redirect_uri = f"{base_url}/auth/apple/callback"
+        
+        # Configure the OAuth client with the dynamic redirect_uri
+        oauth.apple.client_kwargs['redirect_uri'] = redirect_uri
+        
+        # Generate the authorization URL and redirect
+        return await oauth.apple.authorize_redirect(request, redirect_uri)
+    except Exception as e:
+        logger.error(f"Error in Apple login: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to initiate Apple login"
+        )
+
+@app.post('/auth/apple/callback', response_model=Token, tags=["Authentication"])
+async def auth_apple_callback(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Callback para autenticação com Apple.
+    
+    Processa a resposta da Apple após o login e retorna um JWT token.
+    """
+    try:
+        # Get the token from Apple
+        token = await oauth.apple.authorize_access_token(request)
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not get token from Apple"
+            )
+        
+        # Get user info from Apple
+        user_info = await oauth.apple.parse_id_token(request, token)
+        if not user_info or 'sub' not in user_info:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not get user info from Apple"
+            )
+        
+        email = user_info.get('email')
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is required but not provided by Apple"
+            )
+        
+        # Get or create user in database
+        user = db.query(Account).filter(Account.email == email).first()
+        if not user:
+            # Create new user if not exists
+            user = Account(
+                email=email,
+                name=user_info.get('name', email.split('@')[0]),
+                picture=user_info.get('picture'),
+                is_active=True,
+                oauth_provider='apple',
+                oauth_id=user_info['sub']
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        
+        # Create JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.email, "email": user.email},
+            expires_delta=access_token_expires
+        )
+        
+        # Prepare user data for response
+        user_data = {
+            "email": user.email,
+            "name": user.name,
+            "is_active": user.is_active
+        }
+        if user.picture:
+            user_data["picture"] = user.picture
+        
+        # Return the token and user info
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": int(access_token_expires.total_seconds()),
+            "user": user_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in Apple auth callback: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred during authentication"
+        )
+
+
+@app.get("/test-token/{email}", tags=["Testing"])
+async def get_test_token(email: str):
+    """
+    Generate a test JWT token for development.
+    WARNING: This is for development use only! Remove in production.
+    """
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": email, "email": email},
+        expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "email": email,
+        "expires_in": int(access_token_expires.total_seconds())
+    }
 
 
 if __name__ == "__main__":
     uvicorn.run(
         "api:app",
         host="0.0.0.0",
-        port=8000,
+        port=8080,
         reload=True,
         log_level="info"
     )
