@@ -17,7 +17,12 @@ class NLPClient:
         self.timeout = config.get_cli_timeout()
         self.access_token = access_token
         
-    async def process_text(self, text: str, email: Optional[str] = None) -> Dict[str, Any]:
+    async def process_text(
+        self,
+        text: str,
+        email: Optional[str] = None,
+        thread_id: str = "default"
+    ) -> Dict[str, Any]:
         """
         Send text to the NLP processor and get a response.
         
@@ -31,7 +36,7 @@ class NLPClient:
         try:
             payload = {
                 "text": text,
-                "thread_id": "default"  # Default thread_id as per API's ProcessRequest model
+                "thread_id": thread_id or "default"  # Default thread_id as per API's ProcessRequest model
             }
             if email:
                 payload["email"] = email

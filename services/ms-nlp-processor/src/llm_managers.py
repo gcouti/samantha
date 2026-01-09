@@ -2,35 +2,32 @@
 LLM Managers module
 """
 import logging
-import aiohttp
-import operator
+
 from datetime import datetime
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, TypedDict, Annotated
+from typing import Dict, Any, List, Optional
 
+from pydantic import BaseModel, field_validator, ValidationError, Field
 from tools.gmail_tool import GmailTool
 from tools.web_search_tool import WebSearchTool
 from tools.note_tool import ObsidianGitHubTool
 from dotenv import load_dotenv
 from agents.base_agent import AgentState, BaseAgent
 from agents.general_agent import GeneralAgent
-from agents.configuration_agent import ConfigurationAgent
+from agents.executor_agent import ExecutorAgent
+from agents.synthesizer_agent import SynthesizerAgent
 from agents.utils import collect_agent_descriptions, collect_tool_descriptions
 
 # Imports do LangGraph geralmente vêm do sub módulo 'graph'
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from database.database import get_db
 from database.crud import get_user_by_email, update_user_notes_path
 from llm_providers import LLMConfig, LLMProviderFactory, LLMProvider, BaseLLMProvider
-
-from langchain_google_community import GmailToolkit
-from langchain_google_community.gmail.utils import build_resource_service, get_gmail_credentials
-
 
 load_dotenv()
 
@@ -117,28 +114,30 @@ class LangGraphManager(BaseLLMManager):
         tools = [
             GmailTool().search_gmail_dynamic,
             WebSearchTool().execute,
-            ObsidianGitHubTool().search_notes,
-            ObsidianGitHubTool().read_note
+            ObsidianGitHubTool(next(get_db())).search_notes,
+            ObsidianGitHubTool(next(get_db())).read_note,
+            ObsidianGitHubTool(next(get_db())).create_or_update_note
         ]
 
         # Pass the state to the tools so they can access dynamic data like vault_path
         self.tool_node = ToolNode(tools)
 
-        # Bind tools to the LLM client and initialize agents
-        self.llm_with_tools = self.current_provider.client.bind_tools(tools)
-
         self.registred_agents:List[BaseAgent] = [
-            GeneralAgent(self.llm_with_tools),
+            GeneralAgent(self.current_provider),
+            ExecutorAgent(self.current_provider.client.bind_tools(tools), tools),
+            SynthesizerAgent(self.current_provider),
             # ConfigurationAgent(self.llm_with_tools)
+                # IDEAS for agents
+                # agente para verificar o tom do usuário e intervir na conversa com um ser humano
+                # agente para verificar se a resposta final é correta
+                # agente para verificar se a resposta precisa ser atualziada, se é uma pergunta que leva em consideração o tempo
+                # agente para verificar se precisa de mais informações para completar a resposta
+                # agente para completar a query - Exexmplo temperatura hoje? Contexto de localização
         ]
 
-        self.tool_descriptions = collect_tool_descriptions(tools)        
-        self.agent_descriptions = collect_agent_descriptions(self.registred_agents)
-
-        self._has_obsidian_note_flow = (
-            any("search_notes" in desc["name"] for desc in self.tool_descriptions)
-            and any("read_note" in desc["name"] for desc in self.tool_descriptions)
-        )
+        self.supervisor_prompt = LangGraphManager.build_prompt(self.registred_agents, tools)
+        self.route_choices = self._compute_route_choices()
+        self.route_response_model = self._build_route_response_model()
 
         # Create and compile the workflow
         self.workflow = self._create_workflow()
@@ -151,18 +150,18 @@ class LangGraphManager(BaseLLMManager):
         workflow = StateGraph(AgentState)
 
         # Add nodes
-        workflow.add_node("supervisor_node", self._supervisor_node)
         workflow.add_node("tools_node", self.tool_node)
+        workflow.add_node("supervisor_node", self._supervisor_node)
 
         for agent in self.registred_agents:
-            workflow.add_node(agent.name, agent.node)
+            workflow.add_node(agent.name, agent.handle)
         
         # Add edges
         workflow.add_node("check_user_flow", self._check_user_node)
         workflow.add_node("configuration_node", self._configuration_node)
+        workflow.add_node("wait_for_input_node", self._waiting_for_input_node)
         workflow.add_node("handle_notes_path_update_node", self._handle_notes_path_update_node)
         workflow.add_node("authentication_required_node", self._authentication_required_node)
-        workflow.add_node("wait_for_input_node", self._waiting_for_input_node)
 
         # Add edges
         workflow.set_entry_point("check_user_flow")
@@ -177,32 +176,76 @@ class LangGraphManager(BaseLLMManager):
                 "update_notes_path": "handle_notes_path_update_node",
             }
         )
-
-        for agent in self.registred_agents:
-            workflow.add_edge("supervisor_node", agent.name)
-            # workflow.add_edge(agent.name, "supervisor_node")
-            workflow.add_edge(agent.name, END)
         
         workflow.add_edge("configuration_node", "supervisor_node")
         workflow.add_edge("authentication_required_node", END)
         workflow.add_edge("handle_notes_path_update_node", END)
-        workflow.add_edge("supervisor_node", END)
 
         # After the general_agent runs, decide if a tool should be called
         workflow.add_conditional_edges(
-            "supervisor_node",
-            tools_condition, 
-            {
-                "tools": "tools_node",
-                END: END
-            }
+            "supervisor_node",       
+            self._supervisor_condition
         )
 
-        # If a tool was called, run the tool and then go back to the general_agent
-        # to process the tool's output
         workflow.add_edge("tools_node", "supervisor_node")
+
+        for agent in self.registred_agents:
+            
+            if agent.name == ExecutorAgent.AGENT_NAME:
+                workflow.add_conditional_edges(
+                ExecutorAgent.AGENT_NAME,
+                tools_condition,
+                {
+                    "tools": "tools_node",
+                    END: "supervisor_node"
+                }
+            )
+            elif agent.name == SynthesizerAgent.AGENT_NAME:
+                workflow.add_edge(agent.name, END)
+            else:
+                workflow.add_edge(agent.name, "supervisor_node")
         
         return workflow
+
+    def _compute_route_choices(self) -> List[str]:
+        """Return the list of valid supervisor routing options."""
+        base_choices = ["END"]
+        agent_choices = [agent.name for agent in self.registred_agents]
+        seen = set()
+        unique_choices: List[str] = []
+        for choice in base_choices + agent_choices:
+            if choice not in seen:
+                unique_choices.append(choice)
+                seen.add(choice)
+        return unique_choices
+
+    def _build_route_response_model(self) -> BaseModel:
+        """Dynamically build the RouteResponse model with current route choices."""
+        allowed_choices = self.route_choices + ["END"]
+
+        class RouteResponse(BaseModel):
+            next: str
+
+            # Parte "Não Estruturada" (Texto livre para o modelo pensar/explicar)
+            instructions: str = Field(
+                description="Detalhe a instrução que você gostaria de passar para o próximo agente para que ele consiga executar a tarefa"
+            )
+
+            confidence: float = Field(description="Nível de confiança entre 0 e 1 que voce tem que é esse agente que precisa ser executado")
+
+            @field_validator("next")
+            @classmethod
+            def validate_next(cls, value: str) -> str:
+                if value not in allowed_choices:
+                    raise ValueError(
+                        f"Invalid route '{value}'. Expected one of: {', '.join(allowed_choices)}"
+                    )
+                return value
+
+        return RouteResponse
+
+    def _supervisor_condition(self, state: AgentState): 
+        return state["next"]
 
     def _log_state_snapshot(self, node_name: str, updates: Dict[str, Any]) -> None:
         """Log a concise summary of the state delta returned by a node."""
@@ -218,65 +261,71 @@ class LangGraphManager(BaseLLMManager):
             )
         except Exception:
             logger.exception("Failed to log state snapshot for node %s", node_name)
+    
 
-    def _build_capabilities_prompt(self) -> str:
-        """Compose a system prompt describing available agents and tools."""
+    def build_prompt(agent_descriptions: List[Dict[str, str]],
+                     tool_descriptions: List[Dict[str, str]]) -> str:
+            
+            """Build a prompt message."""
+            def _format_block(title: str, items: List[Dict[str, str]]) -> str:
+                lines = "\n".join(f"- {item.name}: {item.description}" for item in items)
+                return f"{title}\n{lines}"
 
-        def _format_block(title: str, items: List[Dict[str, str]]) -> str:
-            lines = "\n".join(f"- {item['name']}: {item['description']}" for item in items)
-            return f"{title}\n{lines}"
+            intro = """
+                Você é um assistente pessoal para executivos. Sua função é direcionar o fluxo para outros
+                agentes computacionais que serão capazes de realizar as tarefas e ajudar a responder a pergunta
 
-        intro = (
-            "Você é um assistente pessoal de elite para executivos. Sua função é responder perguntas,"
-            "executar tarefas e ser proativo."
-        )
+                Você tem a seguinte lista de
+            """
 
-        sections: List[str] = []
-        if self.agent_descriptions:
-            sections.append(_format_block("Agentes disponíveis:", self.agent_descriptions))
-        if self.tool_descriptions:
-            sections.append(_format_block("Ferramentas disponíveis:", self.tool_descriptions))
+            sections: List[str] = []
+            if agent_descriptions:
+                sections.append(_format_block("agentes:", agent_descriptions))
 
-        closing = (
-            "Seja conciso e direto, mas sempre cordial e também tome a decisão se devemos parar de procurar "
-            "respostas. Com base nisso, ache a melhor forma de responder a pergunta do usuário."
-        )
+            closing = """
+                Com base em todo o histórico de mensagens avalie qual agente deve 
+                ser invocado e adicione as instruções que devem seguir para 
+                completar a tarefa. E escreva apenas um passo, pois os demais 
+                serão inseridos em outras chamadas a esse agente
+            """
 
-        prompt_parts = [intro]
-        if sections:
-            prompt_parts.append("\n\n".join(sections))
-        prompt_parts.append(closing)
+            prompt_parts = [intro]
+            if sections:
+                prompt_parts.append("\n\n".join(sections))
+            prompt_parts.append(closing)
 
-        return "\n\n".join(part.strip() for part in prompt_parts if part.strip())
+            return "\n\n".join(part.strip() for part in prompt_parts if part.strip())
     
     async def _supervisor_node(self, state: AgentState) -> AgentState:
         """Injects the system prompt and prepares the state for the general agent."""
         logger.info(f"_supervisor_node preparing state for user: {state.get('user_email')} text: {state.get('text')}")
-        
-        system_prompt = self._build_capabilities_prompt()
-        system_message = SystemMessage(content=system_prompt)
-        
-        # The user's message is already in the state from process_text
-        # We prepend the system message to guide the LLM.
+     
+        # Isso substitui a necessidade de tools_condition
+        chain = self.current_provider.client.with_structured_output(self.route_response_model)
+    
+        # Adicionamos o prompt do sistema antes das mensagens atuais do usuário
+        messages = [SystemMessage(content=self.supervisor_prompt)] + state.get("messages", [])
 
-        # IDEAS for agents
-          # agente para verificar o tom do usuário e intervir na conversa com um ser humano
-          # agente para verificar se a resposta final é correta
-          # agente para verificar se a resposta precisa ser atualziada, se é uma pergunta que leva em consideração o tempo
-          # agente para verificar se precisa de mais informações para completar a resposta
-          # agente para completar a query - Exexmplo temperatura hoje? Contexto de localização 
-        ai_message = self.llm_with_tools.invoke(state["messages"] + [system_message])
-        updates = {"messages": [system_message, ai_message]}
+        try:
+            response = chain.invoke(messages)
+            return {
+                "next": response.next,
+                "messages": AIMessage(content=response.instructions)
+            }
+        except ValidationError as e:
+            logger.error("Failed to parse supervisor response")
+            return {
+                "next": "supervisor_node",
+                "messages": SystemMessage("Use only the possible tools and agents")
+            }
+        # Retornamos apenas a atualização do campo 'next'
         
-        self._log_state_snapshot("_supervisor_node", updates)
-        return updates
+
         
     async def _basic_configuration_required_node(self, state: AgentState) -> AgentState:
         """Generate a response indicating that note path is required."""
         updates = {
-            "response": "Por favor, me passe o caminho do repositório de suas notas.",
-            "confidence": 1.0,
-            "selected_agent": "system",
+            "response": SystemMessage("Por favor, me passe o caminho do repositório de suas notas."),
         }
         self._log_state_snapshot("_basic_configuration_required_node", updates)
         return updates
@@ -285,9 +334,7 @@ class LangGraphManager(BaseLLMManager):
     async def _authentication_required_node(self, state: AgentState) -> AgentState:
         """Generate a response indicating that authentication is required."""
         updates = {
-            "response": "Por favor, autentique-se para continuar. Use o argumento --email ao iniciar o CLI.",
-            "confidence": 1.0,
-            "selected_agent": "system",
+            "response": SystemMessage("Por favor, autentique-se para continuar. Use o argumento --email ao iniciar o CLI."),
         }
         self._log_state_snapshot("_authentication_required_node", updates)
         return updates
@@ -365,7 +412,8 @@ class LangGraphManager(BaseLLMManager):
 
     async def process_text(self, text: str, thread_id: str = "default", email: str = None) -> Dict[str, Any]:
         """Process text using the LangGraph workflow."""
-        try:
+        try:            
+            #TODO: Passar a validação de configurações iniciais pra ca
             initial_state = AgentState(
                 messages=[HumanMessage(content=text)],  # Add the initial user message
                 text=text,
@@ -378,11 +426,20 @@ class LangGraphManager(BaseLLMManager):
 
             # The config is passed to all nodes. The vault_path will be populated
             # by the _check_user_node and will be available in the state for subsequent nodes.
-            config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 10}
+            config = {
+                "recursion_limit": 20,
+                "configurable": {
+                    "thread_id": thread_id
+                }, 
+            }
             result = await self.app.ainvoke(initial_state, config)
 
             # Get the last message content from the state
-            message = result.get("response", [])[-1].content
+            response = result.get("response", [])
+            if response and response.content:
+                message = response.content
+            else:
+                message = "A mensagem estava vazia, aconteceu algum problema!"
 
             return {
                 "response": message,

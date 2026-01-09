@@ -19,6 +19,7 @@ Interface de linha de comando para interagir com o assistente virtual Samantha.
 - Interface colorida e amigável
 - Respostas dinâmicas e variadas
 - Suporte a comandos de saída ('sair', 'exit', 'quit')
+- Shift+Enter inicia rapidamente uma nova thread de conversa
 - Tratamento de erros
 
 ## 🔧 Desenvolvimento

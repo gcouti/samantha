@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from .models import Account
+from .models import Account, Integration
 from typing import Optional
 
 def get_user_by_email(db: Session, email: str) -> Optional[Account]:
@@ -19,3 +19,15 @@ def update_user_notes_path(db: Session, email: str, notes_path: str) -> Optional
         db.refresh(user)
         return user
     return None
+
+
+def get_service_integration(db: Session, email: str, service: str="github") -> Optional[Integration]:
+    """
+    Retrieve the integration for the given user email and service.
+    """
+    return (
+        db.query(Integration)
+        .join(Account, Integration.user_id == Account.id)
+        .filter(Account.email == email, Integration.service == service)
+        .first()
+    )
